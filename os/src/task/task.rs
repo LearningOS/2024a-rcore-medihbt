@@ -1,13 +1,15 @@
 //! Types related to task management & Functions for completely changing TCB
 use super::TaskContext;
 use super::{kstack_alloc, pid_alloc, KernelStack, PidHandle};
-use crate::config::TRAP_CONTEXT_BASE;
+use crate::config::{MAX_SYSCALL_NUM, TRAP_CONTEXT_BASE};
 use crate::mm::{MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE};
 use crate::sync::UPSafeCell;
+use crate::timer;
 use crate::trap::{trap_handler, TrapContext};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::cell::RefMut;
+use core::cell::{Ref, RefMut};
+use core::cmp::Ordering;
 
 /// Task control block structure
 ///
@@ -29,13 +31,22 @@ impl TaskControlBlock {
     pub fn inner_exclusive_access(&self) -> RefMut<'_, TaskControlBlockInner> {
         self.inner.exclusive_access()
     }
+    /// Get the immutable reference of the inner TCB
+    pub fn inner_ro_access(&self) -> Ref<'_, TaskControlBlockInner> {
+        self.inner.ro_access()
+    }
     /// Get the address of app's page table
     pub fn get_user_token(&self) -> usize {
         let inner = self.inner_exclusive_access();
         inner.memory_set.token()
     }
+    /// Trivial getter for priority.
+    pub fn get_priority(&self) -> usize {
+        self.inner.ro_access().sched_info.get_priority()
+    }
 }
 
+/// Inner TCB, which contains inner mutability in a readonly TCB reference.
 pub struct TaskControlBlockInner {
     /// The physical page number of the frame where the trap context is placed
     pub trap_cx_ppn: PhysPageNum,
@@ -68,6 +79,12 @@ pub struct TaskControlBlockInner {
 
     /// Program break
     pub program_brk: usize,
+
+    /// Task statistics
+    pub statistics: TcbStatistics,
+
+    /// Task scheduling infomation
+    pub sched_info: SchedInfo,
 }
 
 impl TaskControlBlockInner {
@@ -82,8 +99,224 @@ impl TaskControlBlockInner {
     fn get_status(&self) -> TaskStatus {
         self.task_status
     }
+    /// Check if a task is zombie.
     pub fn is_zombie(&self) -> bool {
         self.get_status() == TaskStatus::Zombie
+    }
+
+    /// Slot method: activate
+    pub fn on_activate(&mut self) {
+        self.task_status = TaskStatus::Running;
+        self.statistics.on_activate();
+    }
+
+    /// Slot method: deactivate. Run on this task changing state from 'RUNNING' to other state.
+    pub fn on_deactivate(&mut self) {
+        self.statistics.on_deactivate();
+        self.sched_info.update(self.statistics.get_last_run_time());
+    }
+
+    /// Slot method: Run on this TCB is killed.
+    pub fn on_dead(&mut self, task_status: TaskStatus, exit_code: i32) {
+        self.on_deactivate();
+        self.task_status = task_status;
+        self.exit_code   = exit_code;
+    }
+}
+
+#[derive(Clone, Copy)]
+/// Task runtime statistics infomation.
+pub struct TcbStatistics {
+    /// Startup Time
+    pub startup_time: usize,
+
+    /// Syscall Infomation
+    pub syscall_times: [u32; MAX_SYSCALL_NUM],
+
+    /// Run time Infomation: Last-acativated time
+    pub last_activate_time: usize,
+
+    /// Run time infomation: Last-stopped time
+    pub last_deactivate_time: usize,
+}
+
+#[derive(Clone, Copy)]
+/// Data related to stride scheduling algorithm
+pub struct SchedInfo {
+    /// Priority
+    _priority: usize,
+
+    /// Pass (equals to STRIDE_BASE / priority)
+    _pass:     usize,
+
+    /// Current stride
+    _stride:   usize,
+}
+
+/// Stride object, which lives in ready queue.
+#[derive(Clone)]
+pub struct Stride(usize, Arc<TaskControlBlock>);
+
+impl SchedInfo {
+    /// default priority
+    pub const DEFAULT_PRIORITY: usize  = 16;
+
+    /// default pass
+    pub const DEFAULT_BIG_STRIDE: usize = 65537;
+
+    /// default pass, like DEFAULT_BIG_STRIDE / DEFAULT_PRIORITY.
+    pub const DEFAULT_PASS: usize = Self::DEFAULT_BIG_STRIDE / Self::DEFAULT_PRIORITY;
+
+    /// New SchedInfo instance for new process.
+    pub fn new()-> Self {
+        Self {
+            _priority: Self::DEFAULT_PRIORITY,
+            _pass:     Self::DEFAULT_PASS,
+            _stride: 0,
+        }
+    }
+
+    /// New SchedInfo instance for new process, with priority `prio`.
+    pub fn with_priority(prio: usize)-> Self {
+        Self {
+            _priority: prio,
+            // Most of prioroties are running in DEFAULT_PRIORITY,
+            // use this selection to decrease dividing
+            _pass: if prio == Self::DEFAULT_PRIORITY {
+                    Self::DEFAULT_PASS
+                } else {
+                    Self::DEFAULT_BIG_STRIDE / prio
+                },
+            _stride: 0
+        }
+    }
+
+    /// Used in fork(): clone a schedinfo from parent process
+    pub fn clone_from(old_sched_info: &Self)-> Self {
+        Self {
+            _priority: old_sched_info._priority,
+            _pass:     old_sched_info._pass,
+            _stride:   0
+        }
+    }
+
+    /// Reset schedule infomation. This is triggered when calling exec().
+    pub fn full_reset(&mut self) {
+        *self = Self::new()
+    }
+
+    /// Trivial getter: stride
+    pub fn get_stride(&self)-> usize { self._stride }
+    /// Reset: stride
+    pub fn reset_stride(&mut self)-> &mut Self {
+        self._stride = 0; self
+    }
+
+    /// Trivial getter: pass
+    pub fn get_pass(&self)-> usize { self._pass }
+
+    /// Trivial getter: priority
+    pub fn get_priority(&self)-> usize { self._priority }
+    /// Setter: priority
+    ///
+    /// This updates `_pass` field
+    pub fn set_priority(&mut self, priority: usize)-> &mut Self {
+        self._priority = priority;
+        self._pass = match priority {
+            Self::DEFAULT_PRIORITY => Self::DEFAULT_PASS,
+            _ => Self::DEFAULT_BIG_STRIDE / priority,
+        };
+        self
+    }
+
+    /// Update schedule infomation on process run
+    pub fn update(&mut self, dtime: usize)-> &mut Self {
+        self._stride += self._pass as usize * dtime;
+        self
+    }
+}
+
+impl Ord for Stride {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match self.0.cmp(&other.0) {
+            Ordering::Less    => Ordering::Greater,
+            Ordering::Equal   => Ordering::Equal,
+            Ordering::Greater => Ordering::Less,
+        }
+    }
+}
+
+impl PartialOrd for Stride {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        match self.0.cmp(&other.0) {
+            Ordering::Less    => Some(Ordering::Greater),
+            Ordering::Equal   => Some(Ordering::Equal),
+            Ordering::Greater => Some(Ordering::Less),
+        }
+    }
+}
+
+impl PartialEq for Stride {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.eq(&other.0)
+    }
+}
+
+impl Eq for Stride {
+    fn assert_receiver_is_total_eq(&self) {}
+}
+
+impl Stride {
+    /// Convert this Stride into TCB
+    pub fn into_tcb(&self) -> Arc<TaskControlBlock> {
+        self.1.clone()
+    }
+}
+
+impl TcbStatistics {
+    /// Create an enpty task statistics item
+    pub fn empty()-> Self {
+        Self {
+            startup_time: 0,
+            syscall_times: [0; MAX_SYSCALL_NUM],
+            last_activate_time: 0,
+            last_deactivate_time: 0
+        }
+    }
+
+    /// React on process startup
+    pub fn on_activate(&mut self) {
+        if self.startup_time == 0 {
+            self.startup_time = timer::get_time();
+        }
+        self.last_activate_time = timer::get_time();
+    }
+
+    /// React on deactivate
+    pub fn on_deactivate(&mut self) {
+        self.last_deactivate_time = timer::get_time();
+    }
+
+    /// Time between last activate and deactivate
+    pub fn get_last_run_time(&self) -> usize {
+        assert!(self.last_deactivate_time >= self.last_activate_time);
+        self.last_deactivate_time - self.last_activate_time
+    }
+
+    /// React on syscall
+    pub fn on_syscall(&mut self, syscall_id: usize) {
+        self.syscall_times[syscall_id] += 1;
+    }
+
+    /// Reset this
+    pub fn reset(&mut self) {
+        self.startup_time  = 0;
+        self.syscall_times = [0; MAX_SYSCALL_NUM];
+    }
+
+    /// React on executing this
+    pub fn on_exec(&mut self) {
+        self.reset();
     }
 }
 
@@ -118,6 +351,8 @@ impl TaskControlBlock {
                     exit_code: 0,
                     heap_bottom: user_sp,
                     program_brk: user_sp,
+                    statistics:  TcbStatistics::empty(),
+                    sched_info:  SchedInfo::new(),
                 })
             },
         };
@@ -150,6 +385,10 @@ impl TaskControlBlock {
         inner.trap_cx_ppn = trap_cx_ppn;
         // initialize base_size
         inner.base_size = user_sp;
+        // reset statistics data
+        inner.statistics.on_exec();
+        // reset schedule data
+        inner.sched_info.full_reset();
         // initialize trap_cx
         let trap_cx = inner.get_trap_cx();
         *trap_cx = TrapContext::app_init_context(
@@ -191,6 +430,8 @@ impl TaskControlBlock {
                     exit_code: 0,
                     heap_bottom: parent_inner.heap_bottom,
                     program_brk: parent_inner.program_brk,
+                    statistics:  TcbStatistics::empty(),
+                    sched_info:  SchedInfo::clone_from(&parent_inner.sched_info),
                 })
             },
         });
@@ -204,6 +445,14 @@ impl TaskControlBlock {
         task_control_block
         // **** release child PCB
         // ---- release parent PCB
+    }
+
+    /// spawn a new process with elf data `app_elf`
+    pub fn spawn(self: &Arc<Self>, app_elf: &[u8])-> Arc<Self> {
+        let ret = Arc::new(Self::new(app_elf));
+        ret.inner_exclusive_access().parent = Some(Arc::downgrade(&self));
+        self.inner_exclusive_access().children.push(ret.clone());
+        ret
     }
 
     /// get pid of process
@@ -235,6 +484,27 @@ impl TaskControlBlock {
         } else {
             None
         }
+    }
+
+    /// React on activation of this process. This method sets task status to
+    /// `Running` and updates scheduling info.
+    pub fn on_activate(&self)-> &Self {
+        let mut inner = self.inner_exclusive_access();
+        inner.on_activate();
+        self
+    }
+
+    /// Run on deactivation of this task.
+    pub fn on_deactivate(&self, new_status: TaskStatus)-> &Self {
+        let mut inner = self.inner_exclusive_access();
+        inner.task_status = new_status;
+        inner.on_deactivate();
+        self
+    }
+
+    /// Convert this into stride
+    pub fn into_stride(self: &Arc<Self>) -> Stride {
+        Stride(self.inner_ro_access().sched_info._stride, self.clone())
     }
 }
 
